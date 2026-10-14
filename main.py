@@ -2,6 +2,8 @@
 import network
 import socket
 import time
+import json
+import os
 
 from secrets import WIFI_SSID, WIFI_PASSWORD
 
@@ -21,6 +23,173 @@ while not wlan.isconnected():
 ip = wlan.ifconfig()[0]
 print("Connected!")
 print("Open http://{}".format(ip))
+
+
+SCHEDULE_FILE = "schedule.json"
+MAX_BODY = 2048
+MAX_HEADERS = 2048
+DEFAULT_MEALS = [
+    {"id": "breakfast", "name": "Breakfast", "enabled": True,
+     "time": "07:00", "duration": 2},
+    {"id": "lunch", "name": "Lunch", "enabled": True,
+     "time": "12:00", "duration": 2},
+    {"id": "dinner", "name": "Dinner", "enabled": True,
+     "time": "18:00", "duration": 3},
+]
+
+
+def validate_schedule(data):
+    if not isinstance(data, list) or len(data) != 3:
+        raise ValueError("Exactly three meals are required")
+    validated = []
+    for default in DEFAULT_MEALS:
+        matches = [meal for meal in data
+                   if isinstance(meal, dict) and meal.get("id") == default["id"]]
+        if len(matches) != 1:
+            raise ValueError("Breakfast, Lunch and Dinner are required once each")
+        meal = matches[0]
+        if meal.get("name") != default["name"]:
+            raise ValueError("Invalid meal name")
+        if type(meal.get("enabled")) is not bool:
+            raise ValueError("Enabled must be a boolean")
+        value = meal.get("time")
+        if (not isinstance(value, str) or len(value) != 5 or value[2] != ":"
+                or any(c not in "0123456789" for c in value[:2] + value[3:])
+                or int(value[:2]) > 23 or int(value[3:]) > 59):
+            raise ValueError("Time must be valid HH:MM")
+        duration = meal.get("duration")
+        if type(duration) is not int or not 1 <= duration <= 5:
+            raise ValueError("Duration must be an integer from 1 to 5")
+        validated.append({"id": default["id"], "name": default["name"],
+                          "enabled": meal["enabled"], "time": value,
+                          "duration": duration})
+    return validated
+
+
+def load_schedule():
+    try:
+        with open(SCHEDULE_FILE, "r") as file:
+            # Bound file reads too, so a damaged file cannot exhaust memory.
+            content = file.read(MAX_BODY + 1)
+        if len(content) > MAX_BODY:
+            raise ValueError("Schedule file is too large")
+        return validate_schedule(json.loads(content))
+    except (OSError, ValueError):
+        print("Schedule unavailable or invalid; using defaults")
+        return validate_schedule(DEFAULT_MEALS)
+
+
+def save_schedule(data):
+    temporary = SCHEDULE_FILE + ".tmp"
+    try:
+        with open(temporary, "w") as file:
+            json.dump(data, file)
+        # Do not remove the existing file first: rename replaces it on Pico's FS.
+        os.rename(temporary, SCHEDULE_FILE)
+    except OSError:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+        raise
+
+
+schedule = load_schedule()
+
+
+def read_request(client):
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = client.recv(256)
+        if not chunk:
+            raise ValueError("Incomplete request headers")
+        data += chunk
+        if len(data.split(b"\r\n\r\n", 1)[0]) > MAX_HEADERS:
+            raise ValueError("Request headers are too large")
+    header, body = data.split(b"\r\n\r\n", 1)
+    lines = header.decode("utf-8").split("\r\n")
+    parts = lines[0].split()
+    if len(parts) != 3 or parts[2] not in ("HTTP/1.0", "HTTP/1.1"):
+        raise ValueError("Invalid request line")
+    method, path = parts[:2]
+    headers = {}
+    for line in lines[1:]:
+        if ":" not in line:
+            raise ValueError("Invalid request header")
+        key, value = line.split(":", 1)
+        key = key.strip().lower()
+        if key in headers:
+            raise ValueError("Duplicate request header")
+        headers[key] = value.strip()
+    if "transfer-encoding" in headers:
+        raise ValueError("Transfer-Encoding is not supported")
+    length = headers.get("content-length")
+    if method == "POST" and length is None:
+        raise ValueError("Content-Length is required")
+    if length is None:
+        length = 0
+    elif not length or any(c not in "0123456789" for c in length):
+        raise ValueError("Invalid Content-Length")
+    else:
+        length = int(length)
+    if length > MAX_BODY:
+        raise ValueError("Request body is too large")
+    body = body[:length]
+    while len(body) < length:
+        chunk = client.recv(min(256, length - len(body)))
+        if not chunk:
+            raise ValueError("Incomplete request body")
+        body += chunk
+    return method, path, body
+
+
+def send_response(client, status, content_type, body):
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    header = (
+        "HTTP/1.1 {}\r\n"
+        "Content-Type: {}\r\n"
+        "Content-Length: {}\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n"
+    ).format(status, content_type, len(body))
+    client.sendall(header.encode())
+    client.sendall(body)
+
+
+def send_json(client, status, data):
+    send_response(client, status, "application/json", json.dumps(data))
+
+
+def handle_request(client):
+    global schedule
+    try:
+        method, path, body = read_request(client)
+    except ValueError as error:
+        send_json(client, "400 Bad Request", {"error": str(error)})
+        return
+    if path == "/" and method == "GET":
+        send_response(client, "200 OK", "text/html; charset=utf-8", html)
+    elif path == "/schedule" and method == "GET":
+        send_json(client, "200 OK", schedule)
+    elif path == "/schedule" and method == "POST":
+        try:
+            updated = validate_schedule(json.loads(body.decode("utf-8")))
+        except ValueError as error:
+            send_json(client, "400 Bad Request", {"error": str(error)})
+            return
+        try:
+            save_schedule(updated)
+        except OSError:
+            send_json(client, "500 Internal Server Error",
+                      {"error": "Could not save schedule"})
+            return
+        schedule = updated
+        send_json(client, "200 OK", {"saved": True})
+    elif path in ("/", "/schedule"):
+        send_json(client, "405 Method Not Allowed", {"error": "Method not allowed"})
+    else:
+        send_json(client, "404 Not Found", {"error": "Not found"})
 
 
 html = """<!DOCTYPE html>
@@ -161,19 +330,13 @@ html = """<!DOCTYPE html>
 
     <div id="meals"></div>
 
-    <button onclick="saveSchedule()">Save Schedule</button>
+    <button id="save" onclick="saveSchedule()" disabled>Save Schedule</button>
     <div id="message"></div>
 </div>
 
 <script>
-const meals = [
-    {id:"breakfast", name:"Breakfast",
-     enabled:true, time:"07:00", duration:2},
-    {id:"lunch", name:"Lunch",
-     enabled:true, time:"12:00", duration:2},
-    {id:"dinner", name:"Dinner",
-     enabled:true, time:"18:00", duration:3}
-];
+let meals = [];
+let saving = false;
 
 function render() {
     const container = document.getElementById("meals");
@@ -234,12 +397,48 @@ function setDuration(index, value) {
         .textContent = value + " seconds";
 }
 
-function saveSchedule() {
-    document.getElementById("message").textContent =
-        "Schedule saving is not connected yet.";
+async function loadSchedule() {
+    const message = document.getElementById("message");
+    message.textContent = "Loading schedule...";
+    try {
+        const response = await fetch("/schedule", {cache: "no-store"});
+        if (!response.ok) throw new Error("Could not load schedule");
+        meals = await response.json();
+        render();
+        document.getElementById("save").disabled = false;
+        message.textContent = "";
+    } catch (error) {
+        message.textContent = "Could not load schedule. Refresh to retry.";
+    }
 }
 
-render();
+async function saveSchedule() {
+    if (saving || meals.length !== 3) return;
+    saving = true;
+    const button = document.getElementById("save");
+    const message = document.getElementById("message");
+    button.disabled = true;
+    message.textContent = "Saving schedule...";
+    try {
+        const response = await fetch("/schedule", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(meals)
+        });
+        const result = await response.json();
+        if (!response.ok || result.saved !== true) {
+            throw new Error(result.error || "Could not save schedule");
+        }
+        message.textContent = "Schedule saved.";
+    } catch (error) {
+        message.textContent = "Save failed: " + error.message;
+    } finally {
+        saving = false;
+        button.disabled = false;
+    }
+}
+
+loadSchedule();
 </script>
 </body>
 </html>
@@ -259,18 +458,8 @@ while True:
 
     try:
         client.settimeout(3)
-        request = client.recv(1024)
         print("Request from:", address)
-
-        response = (
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/html; charset=utf-8\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-        )
-
-        client.sendall(response.encode())
-        client.sendall(html.encode())
+        handle_request(client)
 
     except OSError as error:
         print("Client error:", error)
