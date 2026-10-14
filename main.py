@@ -4,6 +4,8 @@ import socket
 import time
 import json
 import os
+import select
+import ntptime
 
 from secrets import WIFI_SSID, WIFI_PASSWORD
 
@@ -17,12 +19,68 @@ timeout = time.ticks_add(time.ticks_ms(), 15000)
 
 while not wlan.isconnected():
     if time.ticks_diff(timeout, time.ticks_ms()) <= 0:
-        raise RuntimeError("Wi-Fi connection timed out")
+        print("Wi-Fi unavailable; waiting for connection in server loop")
+        break
     time.sleep(0.2)
 
 ip = wlan.ifconfig()[0]
-print("Connected!")
-print("Open http://{}".format(ip))
+if wlan.isconnected():
+    print("Connected!")
+    print("Open http://{}".format(ip))
+
+
+# Cloudflare's public NTP IPv4 address avoids a blocking DNS lookup.
+# https://developers.cloudflare.com/time-services/ntp/usage/
+ntptime.host = "162.159.200.1"
+ntptime.timeout = 1
+NTP_SUCCESS_INTERVAL = 24 * 60 * 60 * 1000
+NTP_RETRY_INTERVAL = 5 * 60 * 1000
+clock_valid = False
+last_sync_utc = None
+next_sync = time.ticks_ms()
+
+
+def synchronize_clock():
+    global clock_valid, last_sync_utc, next_sync
+    if time.ticks_diff(time.ticks_ms(), next_sync) < 0:
+        return
+    interval = NTP_RETRY_INTERVAL
+    if wlan.isconnected():
+        try:
+            ntptime.settime()  # RTC stays in UTC; never set it to Eastern time.
+            last_sync_utc = time.time()
+            clock_valid = True
+            interval = NTP_SUCCESS_INTERVAL
+            print("UTC clock synchronized with NTP")
+        except (OSError, ValueError) as error:
+            print("NTP synchronization failed:", error)
+    # Use monotonic ticks: setting the RTC must not alter retry timing.
+    next_sync = time.ticks_add(time.ticks_ms(), interval)
+
+
+def eastern_time(utc_seconds):
+    year = time.gmtime(utc_seconds)[0]
+    # MicroPython weekdays: Monday=0, Sunday=6.
+    march_weekday = time.gmtime(time.mktime((year, 3, 1, 0, 0, 0, 0, 0)))[6]
+    november_weekday = time.gmtime(time.mktime((year, 11, 1, 0, 0, 0, 0, 0)))[6]
+    march_sunday = 1 + (6 - march_weekday) % 7 + 7
+    november_sunday = 1 + (6 - november_weekday) % 7
+    # 02:00 EST = 07:00 UTC; 02:00 EDT = 06:00 UTC.
+    start = time.mktime((year, 3, march_sunday, 7, 0, 0, 0, 0))
+    end = time.mktime((year, 11, november_sunday, 6, 0, 0, 0, 0))
+    daylight = start <= utc_seconds < end
+    offset = -4 if daylight else -5
+    return time.gmtime(utc_seconds + offset * 3600), "EDT" if daylight else "EST"
+
+
+def clock_status():
+    if not clock_valid:
+        return {"synchronized": False}
+    utc = time.time()
+    local, zone = eastern_time(utc)
+    return {"synchronized": True, "utc": list(time.gmtime(utc)[:6]),
+            "local": list(local[:7]), "zone": zone,
+            "seconds_since_sync": max(0, int(utc - last_sync_utc))}
 
 
 SCHEDULE_FILE = "schedule.json"
@@ -170,6 +228,8 @@ def handle_request(client):
         return
     if path == "/" and method == "GET":
         send_response(client, "200 OK", "text/html; charset=utf-8", html)
+    elif path == "/time" and method == "GET":
+        send_json(client, "200 OK", clock_status())
     elif path == "/schedule" and method == "GET":
         send_json(client, "200 OK", schedule)
     elif path == "/schedule" and method == "POST":
@@ -186,7 +246,7 @@ def handle_request(client):
             return
         schedule = updated
         send_json(client, "200 OK", {"saved": True})
-    elif path in ("/", "/schedule"):
+    elif path in ("/", "/schedule", "/time"):
         send_json(client, "405 Method Not Allowed", {"error": "Method not allowed"})
     else:
         send_json(client, "404 Not Found", {"error": "Not found"})
@@ -229,6 +289,9 @@ html = """<!DOCTYPE html>
     h1 { font-size: 24px; margin: 0; }
     .subtitle { color: #777; font-size: 13px; }
     .network { font-size: 12px; color: #555; }
+    #clock { font-size: 13px; color: #555; margin-bottom: 20px; }
+    #clock-time { font-size: 17px; margin: 4px 0; }
+    #clock-status { font-size: 12px; color: #777; }
 
     .meal {
         border: 1px solid #ddd;
@@ -327,6 +390,12 @@ html = """<!DOCTYPE html>
         </div>
         <div class="network">Pico W</div>
     </header>
+
+    <div id="clock" role="status">
+        <div id="clock-date"></div>
+        <div id="clock-time">Time not synchronized</div>
+        <div id="clock-status"></div>
+    </div>
 
     <div id="meals"></div>
 
@@ -438,7 +507,47 @@ async function saveSchedule() {
     }
 }
 
+// Fetch only Pico time; never use the browser's wall clock as a time source.
+async function updateClock() {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const date = document.getElementById("clock-date");
+    const display = document.getElementById("clock-time");
+    const status = document.getElementById("clock-status");
+    try {
+        const response = await fetch("/time", {
+            cache: "no-store", signal: controller.signal
+        });
+        if (!response.ok) throw new Error("Time unavailable");
+        const clock = await response.json();
+        if (!clock.synchronized) {
+            date.textContent = "";
+            display.textContent = "Time not synchronized";
+            status.textContent = "";
+        } else {
+            const [year, month, day, hour, minute, second, weekday] = clock.local;
+            const days = ["Monday", "Tuesday", "Wednesday", "Thursday",
+                          "Friday", "Saturday", "Sunday"];
+            const months = ["January", "February", "March", "April", "May", "June",
+                            "July", "August", "September", "October", "November", "December"];
+            date.textContent = `${days[weekday]}, ${months[month - 1]} ${day}, ${year}`;
+            display.textContent = `${hour % 12 || 12}:${String(minute).padStart(2, "0")}:` +
+                `${String(second).padStart(2, "0")} ${hour < 12 ? "AM" : "PM"} ${clock.zone}`;
+            status.textContent = "Clock synchronized with NTP";
+        }
+    } catch (error) {
+        date.textContent = "";
+        display.textContent = "Time unavailable";
+        status.textContent = "Could not reach Pico; retrying...";
+    } finally {
+        clearTimeout(timeout);
+        // Schedule after completion so slow requests never overlap.
+        setTimeout(updateClock, 1000);
+    }
+}
+
 loadSchedule();
+updateClock();
 </script>
 </body>
 </html>
@@ -451,10 +560,27 @@ server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 server.bind(addr)
 server.listen(1)
 
+poller = select.poll()
+poller.register(server, select.POLLIN)
 print("Web server listening on port 80")
+was_connected = wlan.isconnected()
 
 while True:
-    client, address = server.accept()
+    connected = wlan.isconnected()
+    if connected and not was_connected:
+        print("Open http://{}".format(wlan.ifconfig()[0]))
+        # Try immediately when Wi-Fi returns, unless a daily sync is not due.
+        if not clock_valid:
+            next_sync = time.ticks_ms()
+    was_connected = connected
+    synchronize_clock()
+    if not poller.poll(1000):
+        continue
+    try:
+        client, address = server.accept()
+    except OSError as error:
+        print("Accept error:", error)
+        continue
 
     try:
         client.settimeout(3)
